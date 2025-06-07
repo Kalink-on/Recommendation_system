@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 from scipy.sparse import csr_matrix
 import warnings
 from datetime import datetime
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
 
 warnings.filterwarnings('ignore')
 
@@ -201,6 +203,7 @@ class MovieLensDataPreprocessor:
         """
         Возвращает топ-N фильмов по среднему рейтингу
 
+        Parameters:
         - top_n: количество фильмов в топе
         - min_ratings: минимальное количество оценок для включения в топ
 
@@ -256,6 +259,7 @@ class MovieLensDataPreprocessor:
         """
         Возвращает топ-N фильмов по взвешенному рейтингу (Bayesian Average)
 
+        Parameters:
         - top_n: количество фильмов в топе
         - min_ratings: минимальное количество оценок для включения в топ
         - m_parameter: минимальное число оценок для доверия (если None, берется 90-й перцентиль)
@@ -399,6 +403,318 @@ class MovieLensDataPreprocessor:
         return result[["movieId", "title", "year", "rating_metric", "rating_count", "genres"]]
 
 
+class CollaborativeFiltering:
+    def __init__(self, data, k=20, metric='cosine'):
+        self.data = data
+        self.k = k
+        self.metric = metric
+        self.user_sim_matrix = None
+        self.item_sim_matrix = None
+        self.user_means = None
+        self.item_means = None
+        self.global_mean = None
+        self.popular_items = None
+
+    def fit(self, model_type='both'):
+        """Обучение моделей с кэшированием популярных фильмов"""
+        # Вычисляем средние оценки
+        self.user_means = self.data['ratings'].groupby('userId')['rating'].mean().to_dict()
+        self.item_means = self.data['ratings'].groupby('movieId')['rating'].mean().to_dict()
+        self.global_mean = self.data['ratings']['rating'].mean()
+
+        # Подготавливаем популярные фильмы (fallback)
+        self._prepare_popular_items()
+
+        if model_type in ['user', 'both']:
+            self._fit_user_based()
+        if model_type in ['item', 'both']:
+            self._fit_item_based()
+
+    def _fit_user_based(self):
+        """Обучение User-Based модели"""
+        print(f"{datetime.now()} - Обучение User-Based модели...")
+        ratings_normalized = self.data['ratings'].copy()
+        ratings_normalized['rating'] = ratings_normalized['rating'] - ratings_normalized['userId'].map(self.user_means)
+
+        sparse_matrix = csr_matrix(
+            (ratings_normalized['rating'].values,
+             (ratings_normalized['userId'].map(self.data['user_mapping']),
+              ratings_normalized['movieId'].map(self.data['movie_mapping']))),
+            shape=(len(self.data['user_mapping']), len(self.data['movie_mapping']))
+        )
+        self.user_sim_matrix = cosine_similarity(sparse_matrix)
+
+    from sklearn.neighbors import NearestNeighbors
+
+    def _fit_item_based(self):
+        """Приближенный Item-Based с использованием KNN"""
+        print(f"{datetime.now()} - Обучение приближенной Item-Based модели...")
+
+        # Нормализация оценок
+        ratings_normalized = self.data['ratings'].copy()
+        ratings_normalized['rating'] = ratings_normalized['rating'] - ratings_normalized['movieId'].map(self.item_means)
+
+        # Создаем разреженную матрицу (items x users)
+        sparse_matrix = csr_matrix(
+            (ratings_normalized['rating'].values,
+             (ratings_normalized['movieId'].map(self.data['movie_mapping']),
+              ratings_normalized['userId'].map(self.data['user_mapping']))),
+            shape=(len(self.data['movie_mapping']), len(self.data['user_mapping'])))
+
+        # Используем приближенный метод поиска соседей
+        model = NearestNeighbors(n_neighbors=self.k, metric='cosine', algorithm='brute', n_jobs=-1)
+        model.fit(sparse_matrix)
+
+        # Сохраняем только топ-K соседей для каждого элемента
+        distances, indices = model.kneighbors(sparse_matrix)
+
+        # Создаем разреженную матрицу схожести
+        n_items = sparse_matrix.shape[0]
+        rows = np.repeat(np.arange(n_items), self.k)
+        cols = indices.flatten()
+        data = (1 - distances.flatten())  # преобразуем расстояние в схожесть
+
+        self.item_sim_matrix = csr_matrix((data, (rows, cols)), shape=(n_items, n_items))
+
+    def _prepare_popular_items(self, n=100):
+        """Подготовка списка популярных фильмов"""
+        self.popular_items = (
+            self.data['ratings']
+            .groupby('movieId')
+            .agg(rating_count=('rating', 'count'), avg_rating=('rating', 'mean'))
+            .sort_values(['rating_count', 'avg_rating'], ascending=False)
+            .head(n)
+            .reset_index()
+            .merge(self.data['movies'][['movieId', 'title', 'genres']], on='movieId')
+        )
+        self.popular_items['predicted_rating'] = self.popular_items['avg_rating']
+
+    def recommend_for_new_user(self, survey_answers, n=10, model_type='hybrid'):
+        """
+        Рекомендации для нового пользователя на основе опроса
+
+        Parameters:
+        - survey_answers: словарь с ответами {movieId: rating}
+        - n: количество рекомендаций
+        - model_type: 'content', 'item', 'hybrid' (по умолчанию)
+
+        Returns:
+        - DataFrame с рекомендациями
+        """
+        if not survey_answers:
+            return self.popular_items.head(n)[['movieId', 'title', 'predicted_rating', 'genres']]
+
+        if model_type == 'content':
+            return self._content_based_recommend(survey_answers, n)
+        elif model_type == 'item':
+            return self._item_based_recommend_for_new_user(survey_answers, n)
+        else:
+            # Гибридный подход
+            item_recs = self._item_based_recommend_for_new_user(survey_answers, n * 2)
+            content_recs = self._content_based_recommend(survey_answers, n * 2)
+
+            # Объединяем и удаляем дубликаты
+            hybrid = pd.concat([item_recs, content_recs]).drop_duplicates('movieId')
+            return hybrid.head(n)
+
+    def _item_based_recommend_for_new_user(self, survey_answers, n):
+        """Item-Based рекомендации для нового пользователя"""
+        rated_movies = list(survey_answers.keys())
+        candidates = set(self.data['movie_mapping'].keys()) - set(rated_movies)
+
+        pred_ratings = []
+        for movie_id in candidates:
+            movie_idx = self.data['movie_mapping'].get(movie_id)
+            if movie_idx is None:
+                continue
+
+            sim_scores = []
+            for rated_id, rating in survey_answers.items():
+                rated_idx = self.data['movie_mapping'].get(rated_id)
+                if rated_idx is None:
+                    continue
+                sim = self.item_sim_matrix[movie_idx][rated_idx]
+                sim_scores.append((sim, rating))
+
+            if sim_scores:
+                sim_scores.sort(reverse=True)
+                sim_scores = sim_scores[:self.k]
+                weighted_sum = sum(s * r for s, r in sim_scores)
+                sim_sum = sum(abs(s) for s, _ in sim_scores)
+                pred_rating = weighted_sum / sim_sum if sim_sum > 0 else self.item_means.get(movie_id, self.global_mean)
+            else:
+                pred_rating = self.item_means.get(movie_id, self.global_mean)
+
+            pred_ratings.append((movie_id, pred_rating))
+
+        pred_ratings.sort(key=lambda x: x[1], reverse=True)
+        result = pd.DataFrame(pred_ratings[:n], columns=['movieId', 'predicted_rating'])
+        result = result.merge(self.data['movies'][['movieId', 'title', 'genres']], on='movieId')
+        return result
+
+    def _content_based_recommend(self, survey_answers, n):
+        """Content-Based рекомендации на основе жанров понравившихся фильмов"""
+        # Получаем жанры оцененных фильмов
+        rated_movies = self.data['movies'][self.data['movies']['movieId'].isin(survey_answers.keys())]
+        liked_genres = set()
+        for genres in rated_movies['genres_list']:
+            liked_genres.update(genres)
+
+        # Ищем фильмы с похожими жанрами
+        recommendations = self.data['movies'].copy()
+        recommendations['genre_match'] = recommendations['genres_list'].apply(
+            lambda x: len(set(x) & liked_genres) / len(liked_genres) if liked_genres else 0
+        )
+
+        # Исключаем уже оцененные фильмы
+        recommendations = recommendations[~recommendations['movieId'].isin(survey_answers.keys())]
+
+        # Сортируем по совпадению жанров и популярности
+        top_movies = (
+            recommendations.merge(
+                self.popular_items[['movieId', 'rating_count']],
+                on='movieId',
+                how='left'
+            )
+            .sort_values(['genre_match', 'rating_count'], ascending=False)
+            .head(n)
+        )
+
+        top_movies['predicted_rating'] = top_movies['rating_count']  # Просто для формата
+        return top_movies[['movieId', 'title', 'predicted_rating', 'genres']]
+
+    def recommend_for_existing_user(self, user_id, n=10, model_type='hybrid'):
+        """Рекомендации для существующего пользователя"""
+        if user_id not in self.data['user_mapping']:
+            return self.popular_items.head(n)[['movieId', 'title', 'predicted_rating', 'genres']]
+
+        if model_type == 'user':
+            return self._user_based_recommend(user_id, n)
+        elif model_type == 'item':
+            return self._item_based_recommend(user_id, n)
+        else:
+            # Гибридный подход
+            user_recs = self._user_based_recommend(user_id, n * 2)
+            item_recs = self._item_based_recommend(user_id, n * 2)
+
+            hybrid = pd.concat([user_recs, item_recs]).drop_duplicates('movieId')
+            return hybrid.head(n)
+
+    def _user_based_recommend(self, user_id, n):
+        """User-Based рекомендации"""
+        # Получаем индекс пользователя
+        user_idx = self.data['user_mapping'].get(user_id)
+        if user_idx is None:
+            raise ValueError(f"Пользователь {user_id} не найден в данных")
+
+        # Получаем оценки пользователя
+        user_ratings = self.data['ratings'][self.data['ratings']['userId'] == user_id]
+
+        # Находим k наиболее похожих пользователей
+        sim_scores = list(enumerate(self.user_sim_matrix[user_idx]))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        sim_scores = sim_scores[1:self.k + 1]  # Исключаем самого пользователя
+
+        # Собираем фильмы, которые пользователь еще не оценил
+        all_movies = set(self.data['movie_mapping'].keys())
+        rated_movies = set(user_ratings['movieId'])
+        candidates = list(all_movies - rated_movies)
+
+        # Предсказываем рейтинги для кандидатов
+        pred_ratings = []
+        for movie_id in candidates:
+            movie_idx = self.data['movie_mapping'].get(movie_id)
+            if movie_idx is None:
+                continue
+
+            # Собираем оценки похожих пользователей для этого фильма
+            weighted_sum = 0
+            sim_sum = 0
+            count = 0
+
+            for neighbor_idx, sim in sim_scores:
+                neighbor_id = list(self.data['user_mapping'].keys())[
+                    list(self.data['user_mapping'].values()).index(neighbor_idx)]
+
+                # Проверяем, оценил ли сосед этот фильм
+                neighbor_rating = self.data['ratings'][
+                    (self.data['ratings']['userId'] == neighbor_id) &
+                    (self.data['ratings']['movieId'] == movie_id)]
+
+                if not neighbor_rating.empty:
+                    weighted_sum += sim * neighbor_rating['rating'].values[0]
+                    sim_sum += sim
+                    count += 1
+
+            if count > 0:
+                pred_rating = weighted_sum / sim_sum
+                pred_ratings.append((movie_id, pred_rating))
+
+        # Сортируем по предсказанному рейтингу
+        pred_ratings.sort(key=lambda x: x[1], reverse=True)
+        top_n = pred_ratings[:n]
+
+        # Формируем результат
+        result = pd.DataFrame(top_n, columns=['movieId', 'predicted_rating'])
+        result = result.merge(self.data['movies'][['movieId', 'title']], on='movieId')
+
+        return result[['movieId', 'title', 'predicted_rating']]
+
+    def _item_based_recommend(self, user_id, n):
+        """Item-Based рекомендации"""
+        # Получаем оценки пользователя
+        user_ratings = self.data['ratings'][self.data['ratings']['userId'] == user_id]
+        if user_ratings.empty:
+            raise ValueError(f"Пользователь {user_id} не оценил ни одного фильма")
+
+        # Собираем фильмы, которые пользователь еще не оценил
+        all_movies = set(self.data['movie_mapping'].keys())
+        rated_movies = set(user_ratings['movieId'])
+        candidates = list(all_movies - rated_movies)
+
+        # Предсказываем рейтинги для кандидатов
+        pred_ratings = []
+        for movie_id in candidates:
+            movie_idx = self.data['movie_mapping'].get(movie_id)
+            if movie_idx is None:
+                continue
+
+            # Находим k наиболее похожих фильмов, которые пользователь оценил
+            sim_scores = []
+            for rated_movie_id in rated_movies:
+                rated_movie_idx = self.data['movie_mapping'].get(rated_movie_id)
+                if rated_movie_idx is None:
+                    continue
+
+                sim = self.item_sim_matrix[movie_idx][rated_movie_idx]
+                rating = user_ratings[user_ratings['movieId'] == rated_movie_id]['rating'].values[0]
+                sim_scores.append((sim, rating))
+
+            # Берем топ-k похожих фильмов
+            sim_scores.sort(reverse=True)
+            sim_scores = sim_scores[:self.k]
+
+            if len(sim_scores) == 0:
+                continue
+
+            # Взвешенное среднее
+            weighted_sum = sum(s * r for s, r in sim_scores)
+            sim_sum = sum(s for s, _ in sim_scores)
+
+            pred_rating = weighted_sum / sim_sum
+            pred_ratings.append((movie_id, pred_rating))
+
+        # Сортируем по предсказанному рейтингу
+        pred_ratings.sort(key=lambda x: x[1], reverse=True)
+        top_n = pred_ratings[:n]
+
+        # Формируем результат
+        result = pd.DataFrame(top_n, columns=['movieId', 'predicted_rating'])
+        result = result.merge(self.data['movies'][['movieId', 'title']], on='movieId')
+
+        return result[['movieId', 'title', 'predicted_rating']]
+
+
 if __name__ == "__main__":
     # Пример использования с семплированием 10% данных
     print("Запуск обработки данных...")
@@ -432,6 +748,28 @@ if __name__ == "__main__":
     top_2010 = preprocessor.get_top_by_year(year=2010, top_n=5, metric="weighted")
     print("\nТоп-5 фильмов в 2010 по среднему рейтингу:")
     print(top_2010)
+
+    # Создаем и обучаем модель коллаборативной фильтрации
+    cf = CollaborativeFiltering(prepared_data, k=20)
+
+    # User-Based рекомендации
+    print("\nОбучение User-Based модели...")
+    cf.fit(model_type='user')
+
+    # Получаем рекомендации для пользователя 1
+    user_id = 1
+    print(f"\nUser-Based рекомендации для пользователя {user_id}:")
+    user_recs = cf.recommend_for_existing_user(user_id, n=5, model_type='user')
+    print(user_recs)
+
+    # Item-Based рекомендации
+    print("\nОбучение Item-Based модели...")
+    cf.fit(model_type='item')
+
+    # Получаем рекомендации для пользователя 1
+    print(f"\nItem-Based рекомендации для пользователя {user_id}:")
+    item_recs = cf.recommend_for_existing_user(user_id, n=5, model_type='item')
+    print(item_recs)
 
     # Пример доступа к данным
     print("\nПример подготовленных данных:")
