@@ -715,7 +715,282 @@ class CollaborativeFiltering:
         return result[['movieId', 'title', 'predicted_rating']]
 
 
+class MovieRecommenderSystem:
+    def __init__(self, data_preprocessor):
+        self.data = data_preprocessor
+        self.cf_model = None
+        self.user_profile = None
+
+        # Проверка загрузки данных в конструкторе
+        if self.data.ratings is None:
+            print("\nИнициализация данных...")
+            self.data.load_data()
+            self.data.clean_data()
+            print("Данные успешно загружены и обработаны")
+
+    def initialize_models(self):
+        """Инициализация моделей рекомендаций"""
+        print("\nИнициализация моделей рекомендаций...")
+        prepared_data = self.data.prepare_recommendation_data()
+        self.cf_model = CollaborativeFiltering(prepared_data, k=20)
+        self.cf_model.fit(model_type='both')
+        print("Модели инициализированы и обучены.")
+
+    def run_user_survey(self):
+        """Проведение опроса пользователя для создания профиля"""
+        print("\n=== Анкета для создания профиля пользователя ===")
+        self.user_profile = {
+            'favorite_genres': [],
+            'favorite_years': [],
+            'min_rating': 3.0,
+            'watched_movies': {}
+        }
+
+        # Выбор любимых жанров
+        all_genres = sorted(set(np.concatenate(self.data.movies['genres_list'].values)))
+        print("\nДоступные жанры:")
+        for i, genre in enumerate(all_genres, 1):
+            print(f"{i}. {genre}")
+
+        selected = input("\nВведите номера любимых жанров через запятую (например: 1,3,5): ")
+        selected_indices = [int(i.strip()) - 1 for i in selected.split(',') if i.strip().isdigit()]
+        self.user_profile['favorite_genres'] = [all_genres[i] for i in selected_indices if 0 <= i < len(all_genres)]
+
+        # Выбор предпочитаемых годов выпуска
+        min_year = int(self.data.movies['year'].min())
+        max_year = int(self.data.movies['year'].max())
+        print(f"\nГоды выпуска фильмов: от {min_year} до {max_year}")
+        selected = input("Введите предпочитаемые годы или диапазоны через запятую (например: 1990-2000, 2015): ")
+
+        years = []
+        for part in selected.split(','):
+            part = part.strip()
+            if '-' in part:
+                start, end = map(int, part.split('-'))
+                years.extend(range(start, end + 1))
+            elif part.isdigit():
+                years.append(int(part))
+        self.user_profile['favorite_years'] = [y for y in years if min_year <= y <= max_year]
+
+        # Минимальный рейтинг
+        min_r = input("\nМинимальный средний рейтинг фильмов (по шкале 0.5-5.0, по умолчанию 3.0): ")
+        if min_r.replace('.', '', 1).isdigit():
+            self.user_profile['min_rating'] = max(0.5, min(5.0, float(min_r)))
+
+        # Оценка некоторых фильмов (опционально)
+        print("\nХотите оценить некоторые фильмы для улучшения рекомендаций? (y/n)")
+        if input().lower() == 'y':
+            self.rate_movies_interactive()
+
+        print("\nСпасибо! Ваш профиль сохранен.")
+
+    def rate_movies_interactive(self):
+        """Интерактивная оценка фильмов пользователем"""
+        print("\nОцените несколько фильмов (1-5 звезд) или нажмите Enter для пропуска.")
+
+        # Показываем топ фильмов по популярности для оценки
+        top_movies = self.data.get_top_by_popularity(top_n=20, min_ratings=50)
+
+        for _, row in top_movies.iterrows():
+            print(f"\nФильм: {row['title']} ({row['genres']})")
+            print(f"Средний рейтинг: {row['avg_rating']:.1f}, оценок: {row['rating_count']}")
+            rating = input("Ваша оценка (1-5) или Enter для пропуска: ")
+
+            if rating.replace('.', '', 1).isdigit():
+                rating = max(0.5, min(5.0, float(rating)))
+                self.user_profile['watched_movies'][row['movieId']] = rating
+
+    def get_recommendations_based_on_profile(self, n=10):
+        """Получение рекомендаций на основе профиля пользователя"""
+        if not self.user_profile:
+            print("Профиль пользователя не создан. Запустите опрос сначала.")
+            return None
+
+        # 1. Фильтрация по жанрам и годам
+        filtered = self.data.movies.copy()
+
+        if self.user_profile['favorite_genres']:
+            genre_mask = filtered['genres'].apply(
+                lambda g: any(genre in g for genre in self.user_profile['favorite_genres'])
+            )
+            filtered = filtered[genre_mask]
+
+        if self.user_profile['favorite_years']:
+            filtered = filtered[filtered['year'].isin(self.user_profile['favorite_years'])]
+
+        # 2. Добавляем информацию о рейтингах
+        movie_stats = (
+            self.data.ratings.groupby('movieId')
+            .agg(avg_rating=('rating', 'mean'), rating_count=('rating', 'count'))
+            .reset_index()
+        )
+        filtered = filtered.merge(movie_stats, on='movieId', how='left')
+
+        # 3. Применяем минимальный рейтинг
+        filtered = filtered[filtered['avg_rating'] >= self.user_profile['min_rating']]
+
+        # 4. Исключаем уже оцененные фильмы
+        if self.user_profile['watched_movies']:
+            filtered = filtered[~filtered['movieId'].isin(self.user_profile['watched_movies'].keys())]
+
+        # 5. Сортируем по взвешенному рейтингу
+        C = filtered['avg_rating'].mean()
+        m = filtered['rating_count'].quantile(0.75)
+        filtered['weighted_rating'] = ((filtered['avg_rating'] * filtered['rating_count']) + (C * m)) / (
+                    filtered['rating_count'] + m)
+
+        recommendations = filtered.sort_values('weighted_rating', ascending=False).head(n)
+
+        return recommendations[['movieId', 'title', 'year', 'genres', 'avg_rating', 'rating_count']]
+
+    def interactive_movie_search(self):
+        """Интерактивный поиск фильмов с фильтрами"""
+        print("\n=== Расширенный поиск фильмов ===")
+
+        # Инициализация фильтров
+        filters = {
+            'title': '',
+            'genres': [],
+            'year_from': None,
+            'year_to': None,
+            'min_rating': None,
+            'min_votes': None
+        }
+
+        while True:
+            print("\nТекущие фильтры:")
+            print(f"1. Название: {filters['title'] or 'не задано'}")
+            print(f"2. Жанры: {', '.join(filters['genres']) or 'не заданы'}")
+            print(f"3. Годы: {filters['year_from'] or '?'} - {filters['year_to'] or '?'}")
+            print(f"4. Минимальный рейтинг: {filters['min_rating'] or 'не задан'}")
+            print(f"5. Минимальное количество оценок: {filters['min_votes'] or 'не задано'}")
+            print("\nВыберите параметр для изменения (1-5) или Enter для поиска:")
+
+            choice = input()
+            if not choice:
+                break
+
+            if choice == '1':
+                filters['title'] = input("Введите часть названия фильма: ").strip()
+            elif choice == '2':
+                all_genres = sorted(set(np.concatenate(self.data.movies['genres_list'].values)))
+                print("\nДоступные жанры:")
+                for i, genre in enumerate(all_genres, 1):
+                    print(f"{i}. {genre}")
+                selected = input("\nВведите номера жанров через запятую: ")
+                selected_indices = [int(i.strip()) - 1 for i in selected.split(',') if i.strip().isdigit()]
+                filters['genres'] = [all_genres[i] for i in selected_indices if 0 <= i < len(all_genres)]
+            elif choice == '3':
+                min_year = int(self.data.movies['year'].min())
+                max_year = int(self.data.movies['year'].max())
+                print(f"Доступные годы: {min_year}-{max_year}")
+                filters['year_from'] = int(input("Год от: ") or min_year)
+                filters['year_to'] = int(input("Год до: ") or max_year)
+            elif choice == '4':
+                filters['min_rating'] = float(input("Минимальный средний рейтинг (0.5-5.0): ") or 0)
+            elif choice == '5':
+                filters['min_votes'] = int(input("Минимальное количество оценок: ") or 0)
+
+        # Применяем фильтры
+        results = self.data.movies.copy()
+
+        # Фильтр по названию
+        if filters['title']:
+            results = results[results['title'].str.contains(filters['title'], case=False, na=False)]
+
+        # Фильтр по жанрам
+        if filters['genres']:
+            genre_mask = results['genres'].apply(
+                lambda g: all(genre in g for genre in filters['genres'])
+            )
+            results = results[genre_mask]
+
+        # Фильтр по годам
+        if filters['year_from'] or filters['year_to']:
+            year_from = filters['year_from'] or self.data.movies['year'].min()
+            year_to = filters['year_to'] or self.data.movies['year'].max()
+            results = results[(results['year'] >= year_from) & (results['year'] <= year_to)]
+
+        # Добавляем информацию о рейтингах
+        movie_stats = (
+            self.data.ratings.groupby('movieId')
+            .agg(avg_rating=('rating', 'mean'), rating_count=('rating', 'count'))
+            .reset_index()
+        )
+        results = results.merge(movie_stats, on='movieId', how='left')
+
+        # Фильтр по рейтингу
+        if filters['min_rating']:
+            results = results[results['avg_rating'] >= filters['min_rating']]
+
+        # Фильтр по количеству оценок
+        if filters['min_votes']:
+            results = results[results['rating_count'] >= filters['min_votes']]
+
+        # Сортируем результаты
+        if not results.empty:
+            results = results.sort_values('avg_rating', ascending=False)
+            print(f"\nНайдено {len(results)} фильмов. Топ-10:")
+            return results.head(10)[['movieId', 'title', 'year', 'genres', 'avg_rating', 'rating_count']]
+        else:
+            print("\nПо вашему запросу ничего не найдено.")
+            return None
+
+    def run_interactive_loop(self):
+        """Основной интерактивный цикл программы"""
+        print("\n=== Система рекомендаций фильмов ===")
+
+        # Инициализация моделей
+        self.initialize_models()
+
+        while True:
+            print("\nГлавное меню:")
+            print("1. Пройти опрос для создания профиля")
+            print("2. Получить рекомендации на основе профиля")
+            print("3. Расширенный поиск фильмов")
+            print("4. Получить рекомендации для существующего пользователя")
+            print("5. Выход")
+
+            choice = input("Выберите действие (1-5): ")
+
+            if choice == '1':
+                self.run_user_survey()
+            elif choice == '2':
+                if not self.user_profile:
+                    print("Сначала создайте профиль через опрос.")
+                    continue
+                recs = self.get_recommendations_based_on_profile(10)
+                if recs is not None:
+                    print("\nРекомендуемые для вас фильмы:")
+                    print(recs.to_string(index=False))
+            elif choice == '3':
+                results = self.interactive_movie_search()
+                if results is not None:
+                    print(results.to_string(index=False))
+            elif choice == '4':
+                user_id = int(input("Введите ID пользователя (1-610): ") or 1)
+                recs = self.cf_model.recommend_for_existing_user(user_id, 10)
+                print("\nРекомендации для пользователя:")
+                print(recs.to_string(index=False))
+            elif choice == '5':
+                print("До свидания!")
+                break
+
+
 if __name__ == "__main__":
+    # Инициализация системы
+    print("Запуск системы рекомендаций фильмов...")
+
+    # Создаем препроцессор с меньшим набором данных для демонстрации
+    preprocessor = MovieLensDataPreprocessor(
+        data_path='ml-latest/',
+        sample_fraction=0.1  # Используем 10% данных для демонстрации
+    )
+
+    # Запускаем интерактивный интерфейс
+    recommender = MovieRecommenderSystem(preprocessor)
+    recommender.run_interactive_loop()
+
     # Пример использования с семплированием 10% данных
     print("Запуск обработки данных...")
     preprocessor = MovieLensDataPreprocessor(
