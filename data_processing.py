@@ -3,6 +3,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.sparse import csr_matrix
 import warnings
+import tkinter as tk
+from tkinter import messagebox
+import json
+import os
+import sys
 from datetime import datetime
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.neighbors import NearestNeighbors
@@ -11,7 +16,7 @@ warnings.filterwarnings('ignore')
 
 
 class MovieLensDataPreprocessor:
-    def __init__(self, data_path='./', sample_fraction=None):
+    def __init__(self, data_path='./', sample_fraction=None, dev_mode=False):
         """
         Инициализация с возможностью семплирования данных
 
@@ -19,6 +24,7 @@ class MovieLensDataPreprocessor:
         - data_path: путь к папке с данными
         - sample_fraction: доля данных для семплирования (None для всех данных)
         """
+        self.dev_mode = dev_mode
         self.data_path = data_path
         self.sample_fraction = sample_fraction
         self.movies = None
@@ -92,7 +98,12 @@ class MovieLensDataPreprocessor:
 
     def analyze_data(self):
         """Оптимизированный анализ данных"""
-        print(f"{datetime.now()} - Анализ данных...")
+        if not self.dev_mode:
+            return
+
+        print(f"\n=== ДИАГНОСТИКА (режим разработчика) ===")
+        print(f"Фильмов: {len(self.movies)}, Оценок: {len(self.ratings)}")
+        print(f"Топ-5 фильмов по популярности:\n{self.ratings['movieId'].value_counts().head(5)}")
 
         # Распределение рейтингов (по частям для экономии памяти)
         plt.figure(figsize=(10, 5))
@@ -101,18 +112,6 @@ class MovieLensDataPreprocessor:
         plt.xlabel('Рейтинг')
         plt.ylabel('Количество оценок')
         plt.show()
-
-        # Топ фильмов (вычисляем через groupby с агрегацией)
-        top_movies = (
-            self.ratings.groupby('movieId')
-            .agg(rating_count=('rating', 'count'), avg_rating=('rating', 'mean'))
-            .sort_values('rating_count', ascending=False)
-            .head(10)
-            .merge(self.movies, on='movieId')
-        )
-
-        print("\nТоп-10 фильмов по количеству оценок:")
-        print(top_movies[['movieId', 'title', 'rating_count', 'avg_rating']])
 
         # Распределение жанров (оптимизированный подсчет)
         genre_counts = pd.Series(
@@ -130,6 +129,9 @@ class MovieLensDataPreprocessor:
     def prepare_recommendation_data(self):
         """Подготовка данных с использованием разреженных матриц"""
         print(f"{datetime.now()} - Подготовка рекомендательных данных...")
+
+        valid_movies = set(self.movies['movieId']) & set(self.ratings['movieId'])
+        self.ratings = self.ratings[self.ratings['movieId'].isin(valid_movies)]
 
         # 1. Подготовка данных для популярных рекомендаций
         movie_stats = (
@@ -298,7 +300,7 @@ class MovieLensDataPreprocessor:
 
         return top_movies[['movieId', 'title', 'weighted_rating', 'rating_count', 'avg_rating', 'genres']]
 
-    def get_top_by_genre(self, genre, top_n=10, min_ratings=50, metric="weighted", m_parameter=None ):
+    def get_top_by_genre(self, genre, top_n=10, min_ratings=50, metric="weighted", m_parameter=None):
         """
         Возвращает топ-N фильмов указанного жанра по выбранной метрике, используя существующие методы.
 
@@ -310,7 +312,7 @@ class MovieLensDataPreprocessor:
         - m_parameter: параметр m для взвешенного рейтинга (если None - 90-й перцентиль)
 
         Returns:
-        - DataFrame с колонками: movieId, title, rating_metric, rating_count, genres
+        - DataFrame с колонками: movieId, title, year, rating_metric, rating_count, genres
         """
         # 1. Фильтрация по жанру
         genre_mask = self.movies["genres"].str.contains(genre, case=False, na=False)
@@ -347,7 +349,11 @@ class MovieLensDataPreprocessor:
         self.ratings = original_ratings
         self.movies = original_movies
 
-        return result[["movieId", "title", "rating_metric", "rating_count", "genres"]]
+        # 6. Добавляем год в результат (главное изменение)
+        if 'year' not in result.columns:
+            result['year'] = result['title'].str.extract(r'\((\d{4})\)')
+
+        return result[["movieId", "title", "year", "rating_metric", "rating_count", "genres"]]
 
     def get_top_by_year(self, year, top_n=10, min_ratings=50, metric="weighted", m_parameter=None):
         """
@@ -501,21 +507,62 @@ class CollaborativeFiltering:
         Returns:
         - DataFrame с рекомендациями
         """
-        if not survey_answers:
-            return self.popular_items.head(n)[['movieId', 'title', 'predicted_rating', 'genres']]
+        # Проверка и очистка входных данных
+        if not survey_answers or not isinstance(survey_answers, dict):
+            return self._get_fallback_recommendations(n)
 
-        if model_type == 'content':
-            return self._content_based_recommend(survey_answers, n)
-        elif model_type == 'item':
+        # Фильтруем только существующие movieId
+        valid_answers = {
+            int(movie_id): float(rating)
+            for movie_id, rating in survey_answers.items()
+            if str(movie_id).isdigit()
+               and int(movie_id) in self.data['movie_mapping']
+               and 0.5 <= float(rating) <= 5.0
+        }
+
+        # Если нет валидных ответов, возвращаем популярные фильмы
+        if not valid_answers:
+            return self._get_fallback_recommendations(n)
+
+        try:
+            if model_type == 'content':
+                return self._content_based_recommend(valid_answers, n)
+            elif model_type == 'item':
+                return self._safe_item_based_recommend(valid_answers, n)
+            else:
+                # Гибридный подход с обработкой ошибок
+                try:
+                    item_recs = self._safe_item_based_recommend(valid_answers, n * 2)
+                except Exception as e:
+                    print(f"Item-based failed: {str(e)}")
+                    item_recs = self._get_fallback_recommendations(n)
+
+                try:
+                    content_recs = self._content_based_recommend(valid_answers, n * 2)
+                except Exception as e:
+                    print(f"Content-based failed: {str(e)}")
+                    content_recs = self._get_fallback_recommendations(n)
+
+                # Объединяем результаты
+                hybrid = pd.concat([item_recs, content_recs]).drop_duplicates('movieId')
+                return hybrid.head(n) if not hybrid.empty else self._get_fallback_recommendations(n)
+
+        except Exception as e:
+            print(f"Recommendation error: {str(e)}")
+            return self._get_fallback_recommendations(n)
+
+    def _safe_item_based_recommend(self, survey_answers, n):
+        """Безопасная версия item-based рекомендаций"""
+        try:
             return self._item_based_recommend_for_new_user(survey_answers, n)
-        else:
-            # Гибридный подход
-            item_recs = self._item_based_recommend_for_new_user(survey_answers, n * 2)
-            content_recs = self._content_based_recommend(survey_answers, n * 2)
+        except IndexError:
+            # Пересчитываем матрицу сходства при ошибке индексации
+            self._fit_item_based()
+            return self._item_based_recommend_for_new_user(survey_answers, n)
 
-            # Объединяем и удаляем дубликаты
-            hybrid = pd.concat([item_recs, content_recs]).drop_duplicates('movieId')
-            return hybrid.head(n)
+    def _get_fallback_recommendations(self, n):
+        """Резервные рекомендации"""
+        return self.popular_items.head(n)[['movieId', 'title', 'predicted_rating', 'genres']]
 
     def _item_based_recommend_for_new_user(self, survey_answers, n):
         """Item-Based рекомендации для нового пользователя"""
@@ -524,9 +571,11 @@ class CollaborativeFiltering:
 
         pred_ratings = []
         for movie_id in candidates:
-            movie_idx = self.data['movie_mapping'].get(movie_id)
-            if movie_idx is None:
-                continue
+            # Проверяем, есть ли фильм в маппинге
+            if movie_id not in self.data['movie_mapping']:
+                continue  # Пропускаем неизвестные фильмы
+
+            movie_idx = self.data['movie_mapping'][movie_id]
 
             sim_scores = []
             for rated_id, rating in survey_answers.items():
@@ -714,339 +763,610 @@ class CollaborativeFiltering:
 
         return result[['movieId', 'title', 'predicted_rating']]
 
+def run_dev_mode():
+    print("=== Консольный режим проверки данных ===")
 
-class MovieRecommenderSystem:
-    def __init__(self, data_preprocessor):
-        self.data = data_preprocessor
-        self.cf_model = None
-        self.user_profile = None
+    # 1. Инициализация и загрузка данных
+    print("\nЗагрузка данных...")
+    preprocessor = MovieLensDataPreprocessor(
+        data_path='ml-latest/',
+        sample_fraction=0.1,
+        dev_mode=True
+    )
 
-        # Проверка загрузки данных в конструкторе
-        if self.data.ratings is None:
-            print("\nИнициализация данных...")
-            self.data.load_data()
-            self.data.clean_data()
-            print("Данные успешно загружены и обработаны")
+    # Запускаем весь пайплайн обработки
+    prepared_data = preprocessor.run_pipeline()
 
-    def initialize_models(self):
-        """Инициализация моделей рекомендаций"""
-        print("\nИнициализация моделей рекомендаций...")
-        prepared_data = self.data.prepare_recommendation_data()
-        self.cf_model = CollaborativeFiltering(prepared_data, k=20)
+    # 2. Вывод базовой статистики
+    print("\n--- Основная статистика ---")
+    print(f"Загружено фильмов: {len(preprocessor.movies)}")
+    print(f"Загружено оценок: {len(preprocessor.ratings)}")
+    print(f"Пример данных:\n{preprocessor.movies.head(2)}")
+
+    # 3. Анализ топ-фильмов
+    print("\n--- Топ фильмов ---")
+
+    # По среднему рейтингу
+    top_avg = preprocessor.get_top_by_avg_rating(top_n=5, min_ratings=50)
+    print("\nТоп-5 по среднему рейтингу:")
+    print(top_avg[['title', 'avg_rating', 'rating_count']].to_string(index=False))
+
+    # По популярности
+    top_popular = preprocessor.get_top_by_popularity(top_n=5, min_ratings=50)
+    print("\nТоп-5 по популярности:")
+    print(top_popular[['title', 'rating_count', 'avg_rating']].to_string(index=False))
+
+    # По взвешенному рейтингу
+    top_weighted = preprocessor.get_top_by_weighted_rating(top_n=5, min_ratings=50)
+    print("\nТоп-5 по взвешенному рейтингу:")
+    print(top_weighted[['title', 'weighted_rating', 'rating_count']].to_string(index=False))
+
+    # 4. Примеры по жанрам и годам
+    print("\n--- Примеры по категориям ---")
+
+    # Для жанра "Comedy"
+    top_comedy = preprocessor.get_top_by_genre(genre="Comedy", top_n=3, min_ratings=50)
+    available_columns = top_comedy.columns.tolist()
+    columns_to_show = ['title', 'rating_metric', 'genres']
+    columns_to_show = [col for col in columns_to_show if col in available_columns]
+    print("\nТоп-3 комедий:")
+    print(top_comedy[['title', 'year', 'rating_metric']].to_string(index=False))
+
+    # Для года 2010
+    top_2010 = preprocessor.get_top_by_year(year=2010, top_n=3, min_ratings=50)
+    print("\nТоп-3 фильмов 2010 года:")
+    print(top_2010[['title', 'genres', 'rating_metric']].to_string(index=False))
+
+    # 5. Тест рекомендательной системы
+    print("\n--- Тест рекомендаций ---")
+
+    # Инициализация модели
+    cf_model = CollaborativeFiltering(prepared_data, k=20)
+
+    # User-Based рекомендации
+    print("\nUser-Based рекомендации для пользователя 1:")
+    cf_model.fit(model_type='user')
+    user_recs = cf_model.recommend_for_existing_user(user_id=1, n=3)
+    print(user_recs[['title', 'predicted_rating']].to_string(index=False))
+
+    # Item-Based рекомендации
+    print("\nItem-Based рекомендации для пользователя 1:")
+    cf_model.fit(model_type='item')
+    item_recs = cf_model.recommend_for_existing_user(user_id=1, n=3)
+    print(item_recs[['title', 'predicted_rating']].to_string(index=False))
+
+    # 6. Информация о подготовленных данных
+    print("\n--- Методанные ---")
+    print(f"Размер user-item матрицы: {prepared_data['sparse_user_item'].shape}")
+    print(f"Пример данных:\n{prepared_data['movie_data'].head(2)}")
+
+    print("\nПроверка данных завершена!")
+
+class MovieRecommendationApp:
+    def __init__(self, root):
+        self.root = root
+        # Получаем размеры экрана
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+
+        # Вычитаем 50 пикселей для панели задач (можно регулировать)
+        window_height = screen_height - 50
+
+        # Устанавливаем геометрию окна (без overrideredirect)
+        self.root.geometry(f"{screen_width}x{window_height}+0+0")
+        self.root.title("Добро пожаловать в Filmore!")
+        self.root.configure(bg='pink2')
+
+        # Окно будет поверх других окон (опционально)
+        self.root.attributes('-topmost', True)
+        self.root.after(1000, lambda: self.root.attributes('-topmost', False))
+
+        # Стиль приложения (ваши оригинальные настройки)
+        self.bg_color = 'pink2'
+        self.frame_color = 'PaleVioletRed3'
+        self.button_color = 'VioletRed3'
+        self.text_color = 'old lace'
+        self.font = ('Arial', 15)
+        self.title_font = ('Arial', 20)
+
+        # Инициализация компонентов (ваш оригинальный код)
+        self.data_preprocessor = MovieLensDataPreprocessor(data_path='ml-latest/', sample_fraction=0.1, dev_mode=False)
+        self.prepared_data = self.data_preprocessor.run_pipeline()
+        self.cf_model = CollaborativeFiltering(self.prepared_data, k=20)
         self.cf_model.fit(model_type='both')
-        print("Модели инициализированы и обучены.")
+
+        self.user_profile = None
+        self.current_user = None
+        self.users_file = "users.json"
+        self.users = {}
+
+        self.load_users()
+        self.create_main_menu()
+
+    def load_users(self):
+        """Загрузка данных пользователей из файла"""
+        if os.path.exists(self.users_file):
+            try:
+                with open(self.users_file, 'r', encoding='utf-8') as f:
+                    self.users = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                self.users = {}
+
+    def save_users(self):
+        """Сохранение данных пользователей в файл"""
+        with open(self.users_file, 'w', encoding='utf-8') as f:
+            json.dump(self.users, f, ensure_ascii=False, indent=4)
+
+    def create_main_menu(self):
+        """Главное меню приложения"""
+        self.clear_window()
+
+        # Фрейм для заголовка
+        buttonframe1 = tk.Frame(self.root, bg=self.frame_color)
+        buttonframe1.pack(padx=10, pady=40)
+
+        tk.Label(buttonframe1, text="Добро пожаловать в Filmore!",
+                 font=self.title_font, fg=self.text_color, bg=self.button_color
+                 ).pack(padx=10, pady=10)
+
+        # Пустой фрейм для отступа
+        buttonframe2 = tk.Frame(self.root, bg=self.bg_color)
+        buttonframe2.pack(padx=10, pady=20)
+        tk.Label(buttonframe2, text="", font=self.title_font, bg=self.bg_color).pack(padx=10, pady=10)
+
+        # Фрейм для кнопок
+        buttonframe = tk.Frame(self.root, bg=self.frame_color)
+        buttonframe.pack()
+
+        # Кнопки меню
+        tk.Button(buttonframe, text='Войти', font=self.font, height=2, width=14,
+                  fg=self.text_color, bg=self.button_color, command=self.show_login
+                  ).grid(row=0, column=0, padx=10, pady=10)
+
+        tk.Button(buttonframe, text='Регистрация', font=self.font, height=2, width=14,
+                  fg=self.text_color, bg=self.button_color, command=self.show_register
+                  ).grid(row=1, column=0, padx=10, pady=10)
+
+    def clear_window(self):
+        """Очистка окна от всех виджетов"""
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+    def show_login(self):
+        """Окно входа"""
+        login_window = tk.Toplevel(self.root)
+        login_window.geometry("400x300")
+        login_window.title("Вход в систему")
+        login_window.configure(bg=self.bg_color)
+
+        tk.Label(login_window, text="Логин:", font=self.font, bg=self.bg_color).pack(pady=10)
+        self.login_entry = tk.Entry(login_window, font=self.font, width=20)
+        self.login_entry.pack()
+
+        tk.Label(login_window, text="Пароль:", font=self.font, bg=self.bg_color).pack(pady=10)
+        self.password_entry = tk.Entry(login_window, font=self.font, width=20, show="*")
+        self.password_entry.pack()
+
+        tk.Button(login_window, text="Войти", font=self.font, fg=self.text_color,
+                  bg=self.button_color, command=self.login).pack(pady=20)
+
+    def login(self):
+        """Авторизация пользователя"""
+        login = self.login_entry.get()
+        password = self.password_entry.get()
+
+        if not login or not password:
+            messagebox.showerror("Ошибка", "Введите логин и пароль", parent=self.root)
+            return
+
+        if login in self.users and self.users[login]['password'] == password:
+            self.current_user = login
+            self.user_profile = self.users[login].get('profile', {
+                'favorite_genres': [],
+                'favorite_years': [],
+                'min_rating': 3.0,
+                'watched_movies': {}
+            })
+            messagebox.showinfo("Успех", f"Добро пожаловать, {login}!", parent=self.root)
+            self.login_entry.master.destroy()
+            self.show_recommendation_interface()
+        else:
+            messagebox.showerror("Ошибка", "Неверный логин или пароль", parent=self.root)
+
+    def show_register(self):
+        """Окно регистрации"""
+        register_window = tk.Toplevel(self.root)
+        register_window.geometry("400x350")
+        register_window.title("Регистрация")
+        register_window.configure(bg=self.bg_color)
+
+        tk.Label(register_window, text="Регистрация", font=self.title_font,
+                 fg=self.text_color, bg=self.button_color).pack(pady=10)
+
+        tk.Label(register_window, text="Логин:", font=self.font, bg=self.bg_color).pack()
+        self.reg_login_entry = tk.Entry(register_window, font=self.font, width=20)
+        self.reg_login_entry.pack()
+
+        tk.Label(register_window, text="Пароль:", font=self.font, bg=self.bg_color).pack()
+        self.reg_password_entry = tk.Entry(register_window, font=self.font, width=20, show="*")
+        self.reg_password_entry.pack()
+
+        tk.Label(register_window, text="Подтвердите пароль:", font=self.font, bg=self.bg_color).pack()
+        self.reg_confirm_entry = tk.Entry(register_window, font=self.font, width=20, show="*")
+        self.reg_confirm_entry.pack()
+
+        tk.Button(register_window, text="Зарегистрироваться", font=self.font,
+                  fg=self.text_color, bg=self.button_color, command=self.register).pack(pady=15)
+
+    def register(self):
+        """Регистрация нового пользователя"""
+        login = self.reg_login_entry.get()
+        password = self.reg_password_entry.get()
+        confirm = self.reg_confirm_entry.get()
+
+        if not login or not password:
+            messagebox.showerror("Ошибка", "Введите логин и пароль", parent=self.root)
+            return
+
+        if password != confirm:
+            messagebox.showerror("Ошибка", "Пароли не совпадают", parent=self.root)
+            return
+
+        if login in self.users:
+            messagebox.showerror("Ошибка", "Пользователь с таким логином уже существует", parent=self.root)
+            return
+
+        self.users[login] = {
+            'password': password,
+            'profile': {
+                'favorite_genres': [],
+                'favorite_years': [],
+                'min_rating': 3.0,
+                'watched_movies': {}
+            }
+        }
+
+        self.save_users()
+        messagebox.showinfo("Успех", "Регистрация прошла успешно!", parent=self.root)
+        self.reg_login_entry.master.destroy()
+        self.current_user = login
+        self.user_profile = self.users[login]['profile']
+        self.show_recommendation_interface()
+
+    def show_recommendation_interface(self):
+        """Главный интерфейс после входа"""
+        self.clear_window()
+
+        buttonframe1 = tk.Frame(self.root, bg=self.frame_color)
+        buttonframe1.pack(padx=10, pady=20)
+
+        tk.Label(buttonframe1, text=f"Добро пожаловать, {self.current_user}!",
+                 font=self.title_font, fg=self.text_color, bg=self.button_color
+                 ).pack(padx=10, pady=10)
+
+        buttonframe = tk.Frame(self.root, bg=self.frame_color)
+        buttonframe.pack(pady=20)
+
+        tk.Button(buttonframe, text="Пройти опрос", font=self.font, height=2, width=20,
+                  fg=self.text_color, bg=self.button_color, command=self.run_user_survey
+                  ).grid(row=0, column=0, padx=10, pady=10)
+
+        tk.Button(buttonframe, text="Рекомендации", font=self.font, height=2, width=20,
+                  fg=self.text_color, bg=self.button_color, command=self.show_recommendations
+                  ).grid(row=0, column=1, padx=10, pady=10)
+
+        tk.Button(buttonframe, text="Топ фильмов", font=self.font, height=2, width=20,
+                  fg=self.text_color, bg=self.button_color, command=self.show_top_movies
+                  ).grid(row=1, column=0, padx=10, pady=10)
+
+        tk.Button(buttonframe, text="Выйти", font=self.font, height=2, width=20,
+                  fg=self.text_color, bg=self.button_color, command=self.logout
+                  ).grid(row=1, column=1, padx=10, pady=10)
+    def show_top_movies(self):
+        """Красивый интерфейс поиска топ фильмов"""
+        self.clear_window()
+
+        # Основной контейнер
+        main_container = tk.Frame(self.root, bg=self.bg_color)
+        main_container.pack(expand=True, fill=tk.BOTH, padx=20, pady=10)
+
+        # Заголовок
+        tk.Label(main_container, text="Топ фильмов", font=self.title_font,
+                 fg=self.text_color, bg=self.button_color).pack(pady=10)
+
+        # Фрейм управления (3 строки)
+        control_frame = tk.Frame(main_container, bg=self.bg_color)
+        control_frame.pack(pady=5)
+
+        # Строка 1: Критерий
+        tk.Label(control_frame, text="Критерий:", font=self.font, bg=self.bg_color).grid(row=0, column=0, padx=5, pady=5,
+                                                                                         sticky='e')
+        criteria = ['По популярности', 'По жанру', 'По году']
+        self.criterion_var = tk.StringVar(value=criteria[0])
+        criterion_menu = tk.OptionMenu(control_frame, self.criterion_var, *criteria)
+        criterion_menu.config(font=self.font, bg=self.button_color, fg=self.text_color)
+        criterion_menu.grid(row=0, column=1, padx=5, sticky='w')
+
+        # Строка 2: Количество фильмов
+        tk.Label(control_frame, text="Кол-во:", font=self.font, bg=self.bg_color).grid(row=1, column=0, padx=5, pady=5,
+                                                                                       sticky='e')
+        self.top_n_entry = tk.Entry(control_frame, font=self.font, width=5)
+        self.top_n_entry.insert(0, "5")
+        self.top_n_entry.grid(row=1, column=1, padx=5, sticky='w')
+
+        # Строка 3: Параметры поиска (жанр/год)
+        self.params_frame = tk.Frame(control_frame, bg=self.bg_color)
+        self.params_frame.grid(row=2, columnspan=2, pady=5)
+
+        # Combobox для жанра
+        self.genre_frame = tk.Frame(self.params_frame, bg=self.bg_color)
+        tk.Label(self.genre_frame, text="Жанр:", font=self.font, bg=self.bg_color).pack(side=tk.LEFT)
+        all_genres = sorted(set(np.concatenate(self.data_preprocessor.movies['genres_list'].values)))
+        self.genre_var = tk.StringVar(value=all_genres[0] if all_genres else '')
+        genre_menu = tk.OptionMenu(self.genre_frame, self.genre_var, *all_genres)
+        genre_menu.config(font=self.font, bg=self.button_color, fg=self.text_color)
+        genre_menu.pack(side=tk.LEFT, padx=5)
+
+        # Поле для года
+        self.year_frame = tk.Frame(self.params_frame, bg=self.bg_color)
+        tk.Label(self.year_frame, text="Год:", font=self.font, bg=self.bg_color).pack(side=tk.LEFT)
+        self.year_entry = tk.Entry(self.year_frame, font=self.font, width=6)
+        self.year_entry.pack(side=tk.LEFT, padx=5)
+
+        # Строка 4: Кнопка поиска (центрированная)
+        btn_frame = tk.Frame(control_frame, bg=self.bg_color)
+        btn_frame.grid(row=3, columnspan=2, pady=10)
+        tk.Button(btn_frame, text="Найти", font=self.font, fg=self.text_color,
+                  bg=self.button_color, command=self._perform_top_search).pack()
+
+        # Поле результатов (компактное, выше кнопки Назад)
+        result_frame = tk.Frame(main_container, bg=self.bg_color)
+        result_frame.pack(pady=(10, 5), fill=tk.BOTH, expand=True)
+
+        self.result_text = tk.Text(result_frame, font=self.font, height=8, width=50, wrap=tk.WORD)
+        scrollbar = tk.Scrollbar(result_frame, command=self.result_text.yview)
+        self.result_text.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.result_text.config(state='disabled')
+
+        # Кнопка назад (в самом низу)
+        tk.Button(main_container, text="Назад", font=self.font, fg=self.text_color,
+                  bg=self.button_color, command=self.show_recommendation_interface).pack(pady=10)
+
+        # Первоначальная настройка
+        self._update_top_movies_fields()
+        self.criterion_var.trace('w', lambda *args: self._update_top_movies_fields())
+
+    def _update_top_movies_fields(self):
+        """Обновление видимости полей"""
+        # Скрываем все параметры
+        for widget in self.params_frame.winfo_children():
+            widget.pack_forget()
+
+        # Показываем нужные
+        if self.criterion_var.get() == 'По жанру':
+            self.genre_frame.pack(pady=5)
+        elif self.criterion_var.get() == 'По году':
+            self.year_frame.pack(pady=5)
+
+    def _perform_top_search(self):
+        """Выполнение поиска топ фильмов"""
+        try:
+            top_n = int(self.top_n_entry.get())
+            if not 1 <= top_n <= 20:
+                raise ValueError("Количество фильмов должно быть от 1 до 20")
+        except ValueError:
+            messagebox.showerror("Ошибка", "Введите корректное число от 1 до 20", parent=self.root)
+            return
+
+        try:
+            criterion = self.criterion_var.get()
+
+            if criterion == 'По популярности':
+                results = self.data_preprocessor.get_top_by_popularity(top_n=top_n, min_ratings=50)
+                results['rating_metric'] = results['rating_count']  # Добавляем недостающую колонку
+                metric_name = "Количество оценок"
+
+            elif criterion == 'По жанру':
+                genre = self.genre_var.get()  # <-- Получаем значение жанра из виджета
+                results = self.data_preprocessor.get_top_by_genre(
+                    genre=genre,
+                    top_n=top_n,
+                    min_ratings=50,
+                    metric="weighted"
+                )
+                metric_name = "Взвешенный рейтинг"
+
+            elif criterion == 'По году':
+                try:
+                    year = int(self.year_entry.get())
+                    if not 1900 <= year <= datetime.now().year:
+                        raise ValueError(f"Год должен быть от 1900 до {datetime.now().year}")
+                except ValueError:
+                    messagebox.showerror("Ошибка",
+                                         f"Введите корректный год (1900-{datetime.now().year})",
+                                         parent=self.root)
+                    return
+
+                results = self.data_preprocessor.get_top_by_year(
+                    year=year,
+                    top_n=top_n,
+                    min_ratings=50,
+                    metric="weighted"
+                )
+                metric_name = "Взвешенный рейтинг"
+
+            # Отображаем результаты
+            self.result_text.config(state='normal')
+            self.result_text.delete(1.0, tk.END)
+
+            if results.empty:
+                self.result_text.insert(tk.END, "Фильмы не найдены\n")
+            else:
+                for _, row in results.iterrows():
+                    self.result_text.insert(tk.END, f"{row['title']}\n")
+                    self.result_text.insert(tk.END, f"Жанры: {row['genres']}\n")
+                    self.result_text.insert(tk.END, f"{metric_name}: {row['rating_metric']:.2f}\n")
+                    if 'year' in row and not pd.isna(row['year']):
+                        self.result_text.insert(tk.END, f"Год: {int(row['year'])}\n")
+                    self.result_text.insert(tk.END, f"Оценок: {row['rating_count']}\n\n")
+
+            self.result_text.config(state='disabled')
+            self.result_text.see(tk.END)  # Прокручиваем к началу результатов
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e), parent=self.root)
+
+    def logout(self):
+        """Выход из системы"""
+        self.save_profile()
+        self.current_user = None
+        self.user_profile = None
+        self.create_main_menu()
+
+    def save_profile(self):
+        """Сохранение профиля пользователя"""
+        if self.current_user and self.user_profile:
+            self.users[self.current_user]['profile'] = self.user_profile
+            self.save_users()
 
     def run_user_survey(self):
-        """Проведение опроса пользователя для создания профиля"""
-        print("\n=== Анкета для создания профиля пользователя ===")
-        self.user_profile = {
-            'favorite_genres': [],
-            'favorite_years': [],
-            'min_rating': 3.0,
-            'watched_movies': {}
-        }
+        """Опрос пользователя для создания профиля в текущем окне"""
+        self.clear_window()
 
-        # Выбор любимых жанров
-        all_genres = sorted(set(np.concatenate(self.data.movies['genres_list'].values)))
-        print("\nДоступные жанры:")
-        for i, genre in enumerate(all_genres, 1):
-            print(f"{i}. {genre}")
+        tk.Label(self.root, text="Создание профиля", font=self.title_font,
+                 fg=self.text_color, bg=self.button_color).pack(pady=10)
 
-        selected = input("\nВведите номера любимых жанров через запятую (например: 1,3,5): ")
-        selected_indices = [int(i.strip()) - 1 for i in selected.split(',') if i.strip().isdigit()]
-        self.user_profile['favorite_genres'] = [all_genres[i] for i in selected_indices if 0 <= i < len(all_genres)]
+        # Жанры
+        tk.Label(self.root, text="Выберите любимые жанры:", font=self.font, bg=self.bg_color).pack(pady=5)
+        genres_frame = tk.Frame(self.root, bg=self.bg_color)
+        genres_frame.pack(pady=5)
 
-        # Выбор предпочитаемых годов выпуска
-        min_year = int(self.data.movies['year'].min())
-        max_year = int(self.data.movies['year'].max())
-        print(f"\nГоды выпуска фильмов: от {min_year} до {max_year}")
-        selected = input("Введите предпочитаемые годы или диапазоны через запятую (например: 1990-2000, 2015): ")
+        all_genres = sorted(set(np.concatenate(self.data_preprocessor.movies['genres_list'].values)))
+        self.genre_vars = []
+        for i, genre in enumerate(all_genres):
+            var = tk.BooleanVar()
+            self.genre_vars.append((genre, var))
+            tk.Checkbutton(genres_frame, text=genre, variable=var, font=self.font, bg=self.bg_color).grid(row=i // 4,
+                                                                                                          column=i % 4,
+                                                                                                          padx=5,
+                                                                                                          pady=5)
 
-        years = []
-        for part in selected.split(','):
-            part = part.strip()
-            if '-' in part:
-                start, end = map(int, part.split('-'))
-                years.extend(range(start, end + 1))
-            elif part.isdigit():
-                years.append(int(part))
-        self.user_profile['favorite_years'] = [y for y in years if min_year <= y <= max_year]
+        # Годы
+        tk.Label(self.root, text="Введите диапазон годов (например, 1990-2020):", font=self.font,
+                 bg=self.bg_color).pack(pady=5)
+        years_frame = tk.Frame(self.root, bg=self.bg_color)
+        years_frame.pack(pady=5)
+
+        tk.Label(years_frame, text="От:", font=self.font, bg=self.bg_color).pack(side=tk.LEFT)
+        self.year_from_entry = tk.Entry(years_frame, font=self.font, width=6)
+        self.year_from_entry.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(years_frame, text="До:", font=self.font, bg=self.bg_color).pack(side=tk.LEFT)
+        self.year_to_entry = tk.Entry(years_frame, font=self.font, width=6)
+        self.year_to_entry.pack(side=tk.LEFT, padx=5)
 
         # Минимальный рейтинг
-        min_r = input("\nМинимальный средний рейтинг фильмов (по шкале 0.5-5.0, по умолчанию 3.0): ")
-        if min_r.replace('.', '', 1).isdigit():
-            self.user_profile['min_rating'] = max(0.5, min(5.0, float(min_r)))
+        tk.Label(self.root, text="Минимальный рейтинг (0.5-5.0):", font=self.font, bg=self.bg_color).pack(pady=5)
+        self.min_rating_entry = tk.Entry(self.root, font=self.font, width=10)
+        self.min_rating_entry.insert(0, "3.0")
+        self.min_rating_entry.pack(pady=5)
 
-        # Оценка некоторых фильмов (опционально)
-        print("\nХотите оценить некоторые фильмы для улучшения рекомендаций? (y/n)")
-        if input().lower() == 'y':
-            self.rate_movies_interactive()
+        # Оценка фильмов
+        tk.Label(self.root, text="Оцените фильмы (1-5):", font=self.font, bg=self.bg_color).pack(pady=5)
+        movies_frame = tk.Frame(self.root, bg=self.bg_color)
+        movies_frame.pack(pady=5)
 
-        print("\nСпасибо! Ваш профиль сохранен.")
-
-    def rate_movies_interactive(self):
-        """Интерактивная оценка фильмов пользователем"""
-        print("\nОцените несколько фильмов (1-5 звезд) или нажмите Enter для пропуска.")
-
-        # Показываем топ фильмов по популярности для оценки
-        top_movies = self.data.get_top_by_popularity(top_n=20, min_ratings=50)
-
+        top_movies = self.data_preprocessor.get_top_by_popularity(top_n=5, min_ratings=50)
+        self.movie_ratings = {}
         for _, row in top_movies.iterrows():
-            print(f"\nФильм: {row['title']} ({row['genres']})")
-            print(f"Средний рейтинг: {row['avg_rating']:.1f}, оценок: {row['rating_count']}")
-            rating = input("Ваша оценка (1-5) или Enter для пропуска: ")
+            movie_id = row['movieId']
+            title = row['title']
+            tk.Label(movies_frame, text=title, font=self.font, bg=self.bg_color).pack(anchor='w')
+            rating_entry = tk.Entry(movies_frame, font=self.font, width=5)
+            rating_entry.pack(anchor='w')
+            self.movie_ratings[movie_id] = rating_entry
 
-            if rating.replace('.', '', 1).isdigit():
-                rating = max(0.5, min(5.0, float(rating)))
-                self.user_profile['watched_movies'][row['movieId']] = rating
+        def save_survey():
+            # Сохраняем жанры
+            self.user_profile['favorite_genres'] = [genre for genre, var in self.genre_vars if var.get()]
 
-    def get_recommendations_based_on_profile(self, n=10):
-        """Получение рекомендаций на основе профиля пользователя"""
-        if not self.user_profile:
-            print("Профиль пользователя не создан. Запустите опрос сначала.")
-            return None
+            # Сохраняем годы
+            try:
+                year_from = int(self.year_from_entry.get()) if self.year_from_entry.get() else 1900
+                year_to = int(self.year_to_entry.get()) if self.year_to_entry.get() else 2025
+                self.user_profile['favorite_years'] = list(range(year_from, year_to + 1))
+            except ValueError:
+                messagebox.showerror("Ошибка", "Введите корректные годы", parent=self.root)
+                return
 
-        # 1. Фильтрация по жанрам и годам
-        filtered = self.data.movies.copy()
+            # Сохраняем минимальный рейтинг
+            try:
+                min_rating = float(self.min_rating_entry.get())
+                if 0.5 <= min_rating <= 5.0:
+                    self.user_profile['min_rating'] = min_rating
+                else:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Ошибка", "Введите рейтинг от 0.5 до 5.0", parent=self.root)
+                return
 
-        if self.user_profile['favorite_genres']:
-            genre_mask = filtered['genres'].apply(
-                lambda g: any(genre in g for genre in self.user_profile['favorite_genres'])
-            )
-            filtered = filtered[genre_mask]
+            # Сохраняем оценки фильмов
+            for movie_id, entry in self.movie_ratings.items():
+                rating = entry.get()
+                if rating:
+                    try:
+                        rating = float(rating)
+                        if 1.0 <= rating <= 5.0:
+                            self.user_profile['watched_movies'][str(movie_id)] = rating
+                    except ValueError:
+                        pass
 
-        if self.user_profile['favorite_years']:
-            filtered = filtered[filtered['year'].isin(self.user_profile['favorite_years'])]
+            self.save_profile()
+            messagebox.showinfo("Успех", "Профиль сохранен!", parent=self.root)
+            self.show_recommendation_interface()
 
-        # 2. Добавляем информацию о рейтингах
-        movie_stats = (
-            self.data.ratings.groupby('movieId')
-            .agg(avg_rating=('rating', 'mean'), rating_count=('rating', 'count'))
-            .reset_index()
-        )
-        filtered = filtered.merge(movie_stats, on='movieId', how='left')
+        tk.Button(self.root, text="Сохранить", font=self.font, fg=self.text_color,
+                  bg=self.button_color, command=save_survey).pack(pady=10)
+        tk.Button(self.root, text="Назад", font=self.font, fg=self.text_color,
+                  bg=self.button_color, command=self.show_recommendation_interface).pack(pady=10)
 
-        # 3. Применяем минимальный рейтинг
-        filtered = filtered[filtered['avg_rating'] >= self.user_profile['min_rating']]
+    def show_recommendations(self):
+        """Показать рекомендации в текущем окне"""
+        if not self.user_profile or not (
+                self.user_profile.get('favorite_genres') or self.user_profile.get('watched_movies')):
+            messagebox.showwarning("Предупреждение", "Сначала пройдите опрос", parent=self.root)
+            return
 
-        # 4. Исключаем уже оцененные фильмы
-        if self.user_profile['watched_movies']:
-            filtered = filtered[~filtered['movieId'].isin(self.user_profile['watched_movies'].keys())]
+        self.clear_window()
 
-        # 5. Сортируем по взвешенному рейтингу
-        C = filtered['avg_rating'].mean()
-        m = filtered['rating_count'].quantile(0.75)
-        filtered['weighted_rating'] = ((filtered['avg_rating'] * filtered['rating_count']) + (C * m)) / (
-                    filtered['rating_count'] + m)
+        tk.Label(self.root, text="Рекомендации для вас", font=self.title_font,
+                 fg=self.text_color, bg=self.button_color).pack(pady=10)
 
-        recommendations = filtered.sort_values('weighted_rating', ascending=False).head(n)
+        # Получаем рекомендации
+        survey_answers = {int(k): v for k, v in self.user_profile['watched_movies'].items()}
+        recommendations = self.cf_model.recommend_for_new_user(survey_answers, n=10, model_type='hybrid')
 
-        return recommendations[['movieId', 'title', 'year', 'genres', 'avg_rating', 'rating_count']]
+        # Отображаем рекомендации
+        text_area = tk.Text(self.root, font=self.font, height=15, width=50)
+        text_area.pack(pady=10)
+        for _, row in recommendations.iterrows():
+            text_area.insert(tk.END, f"{row['title']} ({row['genres']})\n")
+            text_area.insert(tk.END, f"Предсказанный рейтинг: {row['predicted_rating']:.2f}\n\n")
+        text_area.config(state='disabled')
 
-    def interactive_movie_search(self):
-        """Интерактивный поиск фильмов с фильтрами"""
-        print("\n=== Расширенный поиск фильмов ===")
-
-        # Инициализация фильтров
-        filters = {
-            'title': '',
-            'genres': [],
-            'year_from': None,
-            'year_to': None,
-            'min_rating': None,
-            'min_votes': None
-        }
-
-        while True:
-            print("\nТекущие фильтры:")
-            print(f"1. Название: {filters['title'] or 'не задано'}")
-            print(f"2. Жанры: {', '.join(filters['genres']) or 'не заданы'}")
-            print(f"3. Годы: {filters['year_from'] or '?'} - {filters['year_to'] or '?'}")
-            print(f"4. Минимальный рейтинг: {filters['min_rating'] or 'не задан'}")
-            print(f"5. Минимальное количество оценок: {filters['min_votes'] or 'не задано'}")
-            print("\nВыберите параметр для изменения (1-5) или Enter для поиска:")
-
-            choice = input()
-            if not choice:
-                break
-
-            if choice == '1':
-                filters['title'] = input("Введите часть названия фильма: ").strip()
-            elif choice == '2':
-                all_genres = sorted(set(np.concatenate(self.data.movies['genres_list'].values)))
-                print("\nДоступные жанры:")
-                for i, genre in enumerate(all_genres, 1):
-                    print(f"{i}. {genre}")
-                selected = input("\nВведите номера жанров через запятую: ")
-                selected_indices = [int(i.strip()) - 1 for i in selected.split(',') if i.strip().isdigit()]
-                filters['genres'] = [all_genres[i] for i in selected_indices if 0 <= i < len(all_genres)]
-            elif choice == '3':
-                min_year = int(self.data.movies['year'].min())
-                max_year = int(self.data.movies['year'].max())
-                print(f"Доступные годы: {min_year}-{max_year}")
-                filters['year_from'] = int(input("Год от: ") or min_year)
-                filters['year_to'] = int(input("Год до: ") or max_year)
-            elif choice == '4':
-                filters['min_rating'] = float(input("Минимальный средний рейтинг (0.5-5.0): ") or 0)
-            elif choice == '5':
-                filters['min_votes'] = int(input("Минимальное количество оценок: ") or 0)
-
-        # Применяем фильтры
-        results = self.data.movies.copy()
-
-        # Фильтр по названию
-        if filters['title']:
-            results = results[results['title'].str.contains(filters['title'], case=False, na=False)]
-
-        # Фильтр по жанрам
-        if filters['genres']:
-            genre_mask = results['genres'].apply(
-                lambda g: all(genre in g for genre in filters['genres'])
-            )
-            results = results[genre_mask]
-
-        # Фильтр по годам
-        if filters['year_from'] or filters['year_to']:
-            year_from = filters['year_from'] or self.data.movies['year'].min()
-            year_to = filters['year_to'] or self.data.movies['year'].max()
-            results = results[(results['year'] >= year_from) & (results['year'] <= year_to)]
-
-        # Добавляем информацию о рейтингах
-        movie_stats = (
-            self.data.ratings.groupby('movieId')
-            .agg(avg_rating=('rating', 'mean'), rating_count=('rating', 'count'))
-            .reset_index()
-        )
-        results = results.merge(movie_stats, on='movieId', how='left')
-
-        # Фильтр по рейтингу
-        if filters['min_rating']:
-            results = results[results['avg_rating'] >= filters['min_rating']]
-
-        # Фильтр по количеству оценок
-        if filters['min_votes']:
-            results = results[results['rating_count'] >= filters['min_votes']]
-
-        # Сортируем результаты
-        if not results.empty:
-            results = results.sort_values('avg_rating', ascending=False)
-            print(f"\nНайдено {len(results)} фильмов. Топ-10:")
-            return results.head(10)[['movieId', 'title', 'year', 'genres', 'avg_rating', 'rating_count']]
-        else:
-            print("\nПо вашему запросу ничего не найдено.")
-            return None
-
-    def run_interactive_loop(self):
-        """Основной интерактивный цикл программы"""
-        print("\n=== Система рекомендаций фильмов ===")
-
-        # Инициализация моделей
-        self.initialize_models()
-
-        while True:
-            print("\nГлавное меню:")
-            print("1. Пройти опрос для создания профиля")
-            print("2. Получить рекомендации на основе профиля")
-            print("3. Расширенный поиск фильмов")
-            print("4. Получить рекомендации для существующего пользователя")
-            print("5. Выход")
-
-            choice = input("Выберите действие (1-5): ")
-
-            if choice == '1':
-                self.run_user_survey()
-            elif choice == '2':
-                if not self.user_profile:
-                    print("Сначала создайте профиль через опрос.")
-                    continue
-                recs = self.get_recommendations_based_on_profile(10)
-                if recs is not None:
-                    print("\nРекомендуемые для вас фильмы:")
-                    print(recs.to_string(index=False))
-            elif choice == '3':
-                results = self.interactive_movie_search()
-                if results is not None:
-                    print(results.to_string(index=False))
-            elif choice == '4':
-                user_id = int(input("Введите ID пользователя (1-610): ") or 1)
-                recs = self.cf_model.recommend_for_existing_user(user_id, 10)
-                print("\nРекомендации для пользователя:")
-                print(recs.to_string(index=False))
-            elif choice == '5':
-                print("До свидания!")
-                break
+        tk.Button(self.root, text="Назад", font=self.font, fg=self.text_color,
+                  bg=self.button_color, command=self.show_recommendation_interface).pack(pady=10)
 
 
 if __name__ == "__main__":
-    # Инициализация системы
-    print("Запуск системы рекомендаций фильмов...")
-
-    # Создаем препроцессор с меньшим набором данных для демонстрации
-    preprocessor = MovieLensDataPreprocessor(
-        data_path='ml-latest/',
-        sample_fraction=0.1  # Используем 10% данных для демонстрации
-    )
-
-    # Запускаем интерактивный интерфейс
-    recommender = MovieRecommenderSystem(preprocessor)
-    recommender.run_interactive_loop()
-
-    # Пример использования с семплированием 10% данных
-    print("Запуск обработки данных...")
-    preprocessor = MovieLensDataPreprocessor(
-        data_path='ml-latest/',
-        sample_fraction=0.1  # Используем 10% данных для демонстрации
-    )
-
-    prepared_data = preprocessor.run_pipeline()
-
-    top_movies = preprocessor.get_top_by_avg_rating(top_n=10, min_ratings=50)
-    print("\nТоп-10 фильмов по среднему рейтингу:")
-    print(top_movies)
-
-    top_by_popularity = preprocessor.get_top_by_popularity(top_n=10, min_ratings=50)
-    print("\nТоп-10 фильмов по популярности (количеству оценок):")
-    print(top_by_popularity)
-
-    top_weighted = preprocessor.get_top_by_weighted_rating(top_n=10, min_ratings=50)
-    print("\nТоп-10 фильмов по взвешенному рейтингу:")
-    print(top_weighted)
-
-    top_comedy = preprocessor.get_top_by_genre(genre="Comedy", top_n=5, min_ratings=50,metric="weighted")
-    print("\nТоп-5 фильмов в жанре комедия по взвешенному рейтингу:")
-    print(top_comedy)
-
-    top_comedy = preprocessor.get_top_by_genre(genre="Comedy", top_n=5, min_ratings=50, metric="avg")
-    print("\nТоп-5 фильмов в жанре комедия по среднему рейтингу:")
-    print(top_comedy)
-
-    top_2010 = preprocessor.get_top_by_year(year=2010, top_n=5, metric="weighted")
-    print("\nТоп-5 фильмов в 2010 по среднему рейтингу:")
-    print(top_2010)
-
-    # Создаем и обучаем модель коллаборативной фильтрации
-    cf = CollaborativeFiltering(prepared_data, k=20)
-
-    # User-Based рекомендации
-    print("\nОбучение User-Based модели...")
-    cf.fit(model_type='user')
-
-    # Получаем рекомендации для пользователя 1
-    user_id = 1
-    print(f"\nUser-Based рекомендации для пользователя {user_id}:")
-    user_recs = cf.recommend_for_existing_user(user_id, n=5, model_type='user')
-    print(user_recs)
-
-    # Item-Based рекомендации
-    print("\nОбучение Item-Based модели...")
-    cf.fit(model_type='item')
-
-    # Получаем рекомендации для пользователя 1
-    print(f"\nItem-Based рекомендации для пользователя {user_id}:")
-    item_recs = cf.recommend_for_existing_user(user_id, n=5, model_type='item')
-    print(item_recs)
-
-    # Пример доступа к данным
-    print("\nПример подготовленных данных:")
-    print(prepared_data['movie_data'].head(3))
-    print(f"\nРазреженная матрица: {prepared_data['sparse_user_item'].shape}")
+    dev_mode = len(sys.argv) > 1 and sys.argv[1] == "--dev"
+    if dev_mode:
+        run_dev_mode()
+    else:
+        # Запускаем GUI по умолчанию
+        root = tk.Tk()
+        app = MovieRecommendationApp(root)
+        root.mainloop()
