@@ -1,7 +1,7 @@
-def run_dev_mode():
-    from data_processing import MovieLensDataPreprocessor
-    from algorithms import CollaborativeFiltering
+from data_processing import MovieLensDataPreprocessor
 
+
+def run_dev_mode():
     print("=== Консольный режим проверки данных ===")
     print("\nЗагрузка данных...")
     preprocessor = MovieLensDataPreprocessor(
