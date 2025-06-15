@@ -3,9 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.sparse import csr_matrix
 import warnings
-import os
 from datetime import datetime
-
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings('ignore')
 
@@ -18,43 +18,91 @@ class MovieLensDataPreprocessor:
         self.ratings = None
         self.tags = None
         self.processed_data = None
+        self.loading_complete = False
+        self.loading_error = None
+        self.executor = ThreadPoolExecutor(max_workers=3)
 
-    def load_data(self):
-        print(f"{datetime.now()} - Загрузка данных...")
+    async def load_data_async(self):
+        loop = asyncio.get_running_loop()
 
-        required_files = ['movies.csv', 'ratings.csv']
-        for file in required_files:
-            if not os.path.exists(f'{self.data_path}{file}'):
-                raise FileNotFoundError(f"Файл {file} не найден в {self.data_path}")
+        try:
+            print(f"{datetime.now()} - Начало асинхронной загрузки данных...")
 
-        if self.sample_fraction:
-            self.movies = pd.read_csv(f'{self.data_path}movies.csv')
-            users = pd.read_csv(f'{self.data_path}ratings.csv', usecols=['userId']).drop_duplicates()
-            sampled_users = users.sample(frac=self.sample_fraction)
-
-            self.ratings = pd.read_csv(
-                f'{self.data_path}ratings.csv',
-                chunksize=100000,
-                iterator=True
+            movies_future = loop.run_in_executor(
+                self.executor,
+                lambda: pd.read_csv(f'{self.data_path}movies.csv')
             )
-            self.ratings = pd.concat([chunk[chunk['userId'].isin(sampled_users['userId'])]
-                                    for chunk in self.ratings])
 
-            self.tags = pd.read_csv(
-                f'{self.data_path}tags.csv',
-                chunksize=100000,
-                iterator=True
-            )
-            self.tags = pd.concat([chunk[chunk['userId'].isin(sampled_users['userId'])]
-                                 for chunk in self.tags])
-        else:
-            self.movies = pd.read_csv(f'{self.data_path}movies.csv')
-            self.ratings = pd.read_csv(f'{self.data_path}ratings.csv', chunksize=1000000)
-            self.ratings = pd.concat(self.ratings)
-            self.tags = pd.read_csv(f'{self.data_path}tags.csv', chunksize=1000000)
-            self.tags = pd.concat(self.tags)
+            if self.sample_fraction:
+                users_future = loop.run_in_executor(
+                    self.executor,
+                    lambda: pd.read_csv(f'{self.data_path}ratings.csv', usecols=['userId'])
+                )
+                users = await users_future
+                sampled_users = users.drop_duplicates().sample(frac=self.sample_fraction)
 
-        print(f"{datetime.now()} - Данные загружены. Фильмов: {len(self.movies)}, Оценок: {len(self.ratings)}")
+                ratings_future = loop.run_in_executor(
+                    self.executor,
+                    lambda: self._load_large_file_with_filter(
+                        f'{self.data_path}ratings.csv',
+                        sampled_users['userId']
+                    )
+                )
+
+                tags_future = loop.run_in_executor(
+                    self.executor,
+                    lambda: self._load_large_file_with_filter(
+                        f'{self.data_path}tags.csv',
+                        sampled_users['userId']
+                    )
+                )
+
+                self.movies, self.ratings, self.tags = await asyncio.gather(
+                    movies_future,
+                    ratings_future,
+                    tags_future
+                )
+            else:
+                ratings_future = loop.run_in_executor(
+                    self.executor,
+                    lambda: self._load_large_file(f'{self.data_path}ratings.csv')
+                )
+
+                tags_future = loop.run_in_executor(
+                    self.executor,
+                    lambda: self._load_large_file(f'{self.data_path}tags.csv')
+                )
+
+                self.movies, self.ratings, self.tags = await asyncio.gather(
+                    movies_future,
+                    ratings_future,
+                    tags_future
+                )
+
+            print(f"{datetime.now()} - Данные загружены. Фильмов: {len(self.movies)}, Оценок: {len(self.ratings)}")
+            self.loading_complete = True
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"{datetime.now()} - Ошибка загрузки данных: {error_msg}")
+            self.loading_error = error_msg
+            raise 
+
+    def _load_large_file(self, filepath):
+        """Загрузка больших файлов по частям"""
+        chunks = []
+        for chunk in pd.read_csv(filepath, chunksize=1000000):
+            chunks.append(chunk)
+        return pd.concat(chunks)
+
+    def _load_large_file_with_filter(self, filepath, user_ids):
+        """Загрузка больших файлов с фильтрацией по user_ids"""
+        chunks = []
+        for chunk in pd.read_csv(filepath, chunksize=100000):
+            filtered = chunk[chunk['userId'].isin(user_ids)]
+            if not filtered.empty:
+                chunks.append(filtered)
+        return pd.concat(chunks) if chunks else pd.DataFrame()
 
     def clean_data(self):
         print(f"{datetime.now()} - Очистка данных...")
@@ -147,7 +195,14 @@ class MovieLensDataPreprocessor:
         print(f"{datetime.now()} - Данные сохранены в {filename}")
 
     def run_pipeline(self):
-        self.load_data()
+        import asyncio
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.load_data_async())
+        finally:
+            loop.close()
+
         self.clean_data()
         self.analyze_data()
         prepared_data = self.prepare_recommendation_data()
