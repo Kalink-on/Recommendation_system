@@ -62,8 +62,7 @@ class MovieRecommendationApp:
 
 
     def _on_mousewheel(self, event):
-        """Обработчик прокрутки колесиком мыши"""
-        if self.canvas.winfo_exists():  # Проверяем, что canvas еще существует
+        if self.canvas.winfo_exists():
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _setup_ui(self):
@@ -93,7 +92,6 @@ class MovieRecommendationApp:
         self.canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
         self.content_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
-        # Заменяем bind_all на bind только для canvas и content_frame
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.content_frame.bind("<MouseWheel>", self._on_mousewheel)
 
