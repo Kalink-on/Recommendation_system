@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.neighbors import NearestNeighbors
 from datetime import datetime
 import pandas as pd
 
