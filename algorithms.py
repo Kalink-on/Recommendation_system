@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.neighbors import NearestNeighbors
 from datetime import datetime
 import pandas as pd
 
@@ -25,8 +24,22 @@ class CollaborativeFiltering:
 
         if model_type in ['user', 'both']:
             self._fit_user_based()
+            print("User-based модель обучена. Размер user_sim_matrix:",
+                  getattr(self, 'user_sim_matrix', 'не инициализирована'))
+
         if model_type in ['item', 'both']:
-            self._fit_item_based()
+            try:
+                self._fit_item_based()
+                if not hasattr(self, 'item_sim_matrix'):
+                    raise RuntimeError("item_sim_matrix не создана в _fit_item_based()")
+                print("Item-based модель обучена. Размер item_sim_matrix:",
+                      self.item_sim_matrix.shape if hasattr(self, 'item_sim_matrix') else 'ошибка')
+            except Exception as e:
+                print(f"Ошибка в item-based обучении: {str(e)}")
+                if model_type == 'both':
+                    print("Продолжаем с user-based моделью")
+                else:
+                    raise
 
     def _fit_user_based(self):
         print(f"{datetime.now()} - Обучение User-Based модели...")
@@ -43,36 +56,38 @@ class CollaborativeFiltering:
 
     def _fit_item_based(self):
         print(f"{datetime.now()} - Обучение приближенной Item-Based модели...")
-        ratings_normalized = self.data['ratings'].copy()
-        ratings_normalized['rating'] = ratings_normalized['rating'] - ratings_normalized['movieId'].map(self.item_means)
+        try:
+            ratings_normalized = self.data['ratings'].copy()
+            ratings_normalized['rating'] = ratings_normalized['rating'] - ratings_normalized['movieId'].map(
+                self.item_means)
 
-        rows = ratings_normalized['movieId'].map(self.data['movie_mapping'])
-        cols = ratings_normalized['userId'].map(self.data['user_mapping'])
+            if not all(movie_id in self.data['movie_mapping'] for movie_id in ratings_normalized['movieId'].unique()):
+                raise ValueError("Не все movieId присутствуют в маппинге")
 
-        if (rows < 0).any() or (cols < 0).any():
-            invalid_movies = ratings_normalized[rows < 0]['movieId'].unique()
-            invalid_users = ratings_normalized[cols < 0]['userId'].unique()
-            error_msg = f"Обнаружены отрицательные индексы!\nФильмы: {invalid_movies}\nПользователи: {invalid_users}"
-            raise ValueError(error_msg)
+            rows = ratings_normalized['movieId'].map(self.data['movie_mapping'])
+            cols = ratings_normalized['userId'].map(self.data['user_mapping'])
 
-        sparse_matrix = csr_matrix(
-            (ratings_normalized['rating'].values, (rows, cols)),
-            shape=(len(self.data['movie_mapping']), len(self.data['user_mapping']))
-        )
+            if (rows < 0).any() or (cols < 0).any():
+                invalid_movies = ratings_normalized[rows < 0]['movieId'].unique()
+                invalid_users = ratings_normalized[cols < 0]['userId'].unique()
+                error_msg = f"Обнаружены отрицательные индексы!\nФильмы: {invalid_movies}\nПользователи: {invalid_users}"
+                raise ValueError(error_msg)
 
-        if sparse_matrix.shape[0] == 0 or sparse_matrix.shape[1] == 0:
-            raise ValueError("Размерность матрицы не может быть нулевой")
+            sparse_matrix = csr_matrix(
+                (ratings_normalized['rating'].values, (rows, cols)),
+                shape=(len(self.data['movie_mapping']), len(self.data['user_mapping']))
+            ).T 
 
-        model = NearestNeighbors(n_neighbors=self.k, metric='cosine', algorithm='brute', n_jobs=-1)
-        model.fit(sparse_matrix)
-        distances, indices = model.kneighbors(sparse_matrix)
+            if sparse_matrix.shape[0] == 0 or sparse_matrix.shape[1] == 0:
+                raise ValueError("Размерность матрицы не может быть нулевой")
 
-        n_items = sparse_matrix.shape[0]
-        rows = np.repeat(np.arange(n_items), self.k)
-        cols = indices.flatten()
-        data = (1 - distances.flatten())
+            self.item_sim_matrix = cosine_similarity(sparse_matrix)
+            print(f"{datetime.now()} - Item-Based модель обучена. Размерность матрицы: {self.item_sim_matrix.shape}")
 
-        self.item_sim_matrix = csr_matrix((data, (rows, cols)), shape=(n_items, n_items))
+        except Exception as e:
+            print(f"{datetime.now()} - Ошибка при обучении Item-Based модели: {str(e)}")
+            self.item_sim_matrix = None 
+            raise
 
     def _prepare_popular_items(self, n=100):
         self.popular_items = (

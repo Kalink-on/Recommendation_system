@@ -1,18 +1,17 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 import json
 import os
 import pandas as pd
 import numpy as np
 from datetime import datetime
-
+import threading
 
 class MovieRecommendationApp:
     def __init__(self, root):
         self.root = root
+
         self._setup_window_geometry()
-        self.root.title("Добро пожаловать в Filmore!")
-        self.root.configure(bg='pink2')
 
         self.bg_color = 'pink2'
         self.frame_color = 'PaleVioletRed3'
@@ -21,13 +20,139 @@ class MovieRecommendationApp:
         self.font = ('Arial', self.scale_font(15))
         self.title_font = ('Arial', self.scale_font(20), 'bold')
 
-        self._initialize_data()
+        self.users_file = "users.json"
+        self.users = {}
+        self.user_profile = None
+        self.current_user = None
+
+        self.root.title("Добро пожаловать в Filmore!")
+        self.root.configure(bg=self.bg_color)
+
+        self.data_loaded = False
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         self._setup_ui()
+
+        self._init_async_data()
+
+    def _on_close(self):
+        """Обработчик закрытия окна с подтверждением"""
+        for child in self.root.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                child.destroy()
+                return
+
+        if messagebox.askokcancel(
+                "Выход",
+                "Вы уверены, что хотите выйти?",
+                parent=self.root
+        ):
+
+            if self.current_user:
+                self.save_profile()
+            self.root.destroy()
+
+    def _init_async_data(self):
+        """Неблокирующая инициализация данных"""
+        self.loading_frame = tk.Frame(self.root, bg=self.bg_color)
+        self.loading_label = tk.Label(
+            self.loading_frame,
+            text="Загрузка данных...",
+            font=self.title_font,
+            fg=self.text_color,
+            bg=self.button_color
+        )
+        self.loading_label.pack(pady=20)
+        self.loading_frame.pack(fill=tk.BOTH, expand=True)
+
+        threading.Thread(
+            target=self._background_data_init,
+            daemon=True
+        ).start()
+
+    def _background_data_init(self):
+        """Фоновая инициализация данных"""
+        try:
+            if not hasattr(self, 'root') or not self.root.winfo_exists():
+                return
+
+            self.root.after(0, self._update_loading_text, "Загрузка пользователей...")
+            self.load_users()
+
+            from data_processing import MovieLensDataPreprocessor
+            from algorithms import CollaborativeFiltering
+
+            self.data_preprocessor = MovieLensDataPreprocessor(
+                data_path='ml-latest/',
+                sample_fraction=0.1,
+                dev_mode=False
+            )
+
+            self.root.after(0, self._update_loading_text, "Загрузка фильмов...")
+            self.prepared_data = self.data_preprocessor.run_pipeline()
+
+            self.data_loaded = True
+            self.root.after(0, self._update_loading_text, "Обучение модели...")
+            self.cf_model = CollaborativeFiltering(self.prepared_data, k=20)
+            self.cf_model.fit(model_type='both')
+
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                self.root.after(0, self._init_complete)
+
+        except Exception as e:
+            print(f"Ошибка в _background_data_init: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, self._init_failed, str(e))
+
+    def _update_loading_text(self, text):
+        """Обновление текста загрузки"""
+        try:
+            if hasattr(self, 'loading_label') and self.loading_label.winfo_exists():
+                self.loading_label.config(text=text)
+                self.root.update_idletasks()
+        except Exception as e:
+            print(f"Ошибка при обновлении текста загрузки: {e}")
+
+    def _init_complete(self):
+        try:
+            if not hasattr(self, 'root') or not self.root.winfo_exists():
+                return
+
+            if hasattr(self, 'loading_frame') and self.loading_frame.winfo_exists():
+                self.loading_frame.destroy()
+
+
+            if self.current_user:
+                self.show_recommendation_interface()
+
+        except Exception as e:
+            print(f"Ошибка при завершении инициализации: {e}")
+
+    def _init_failed(self, error):
+        """Обработка ошибок в вашем стиле"""
+        self.loading_label.config(
+            text=f"Ошибка: {error}",
+            fg='red'
+        )
+        tk.Button(
+            self.loading_frame,
+            text="Повторить",
+            command=self._retry_init,
+            font=self.font,
+            fg=self.text_color,
+            bg=self.button_color
+        ).pack(pady=20)
+
+    def _retry_init(self):
+        """Повторная попытка инициализации"""
+        self.loading_frame.destroy()
+        self._init_async_data()
 
     def _setup_window_geometry(self):
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        self.scale_factor = min(1.0, screen_width / 1920)
+        self.scale_factor = min(1.0, screen_width / 1920)  
         window_height = int(screen_height * 0.9)
         window_width = int(screen_width * 0.9)
         x = (screen_width - window_width) // 2
@@ -57,12 +182,12 @@ class MovieRecommendationApp:
         self.user_profile = None
         self.current_user = None
         self.users_file = "users.json"
-        self.users = {}
-        self.load_users()
-
+        self.users = {} 
+        self.load_users() 
 
     def _on_mousewheel(self, event):
-        if self.canvas.winfo_exists():
+        """Обработчик прокрутки колесиком мыши"""
+        if self.canvas.winfo_exists():  
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _setup_ui(self):
@@ -146,6 +271,12 @@ class MovieRecommendationApp:
                   bg=self.button_color, command=self.login).pack(pady=20)
 
     def login(self):
+        if not self.data_loaded:
+            messagebox.showinfo("Информация", "Идёт загрузка данных. Пожалуйста, подождите...")
+            if hasattr(self, 'login_entry') and hasattr(self.login_entry, 'master'):
+                self.login_entry.master.destroy()
+            return
+
         login = self.login_entry.get()
         password = self.password_entry.get()
 
@@ -192,6 +323,12 @@ class MovieRecommendationApp:
                   fg=self.text_color, bg=self.button_color, command=self.register).pack(pady=15)
 
     def register(self):
+        if not self.data_loaded:
+            messagebox.showinfo("Информация", "Идёт загрузка данных. Пожалуйста, подождите...")
+            if hasattr(self, 'reg_login_entry') and hasattr(self.reg_login_entry, 'master'):
+                self.reg_login_entry.master.destroy()
+            return
+
         login = self.reg_login_entry.get()
         password = self.reg_password_entry.get()
         confirm = self.reg_confirm_entry.get()
@@ -393,12 +530,15 @@ class MovieRecommendationApp:
             self.save_users()
 
     def load_users(self):
-        if os.path.exists(self.users_file):
-            try:
+        """Загружает пользователей из JSON-файла."""
+        try:
+            if os.path.exists(self.users_file):
                 with open(self.users_file, 'r', encoding='utf-8') as f:
                     self.users = json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError):
-                self.users = {}
+            else:
+                self.users = {} 
+        except (json.JSONDecodeError, FileNotFoundError):
+            self.users = {}
 
     def save_users(self):
         with open(self.users_file, 'w', encoding='utf-8') as f:
@@ -423,6 +563,9 @@ class MovieRecommendationApp:
 
         tk.Button(self.root, text="Далее →", font=self.font, fg=self.text_color,
                   bg=self.button_color, command=lambda: self._load_movies_for_survey()).pack(pady=10)
+
+        tk.Button(self.root, text="Назад", font=self.font, fg=self.text_color,
+                  bg=self.button_color, command=self.show_recommendation_interface).pack(pady=10)
 
     def _load_movies_for_survey(self):
         selected_genres = [genre for genre, var in self.genre_vars if var.get()]
@@ -476,7 +619,7 @@ class MovieRecommendationApp:
                   bg=self.button_color, command=self.save_survey).pack(pady=10)
 
         tk.Button(self.root, text="Назад", font=self.font, fg=self.text_color,
-                  bg=self.button_color, command=self.show_recommendation_interface).pack(pady=10)
+                  bg=self.button_color, command=self.run_user_survey).pack(pady=10)
 
     def save_survey(self):
         try:
@@ -607,6 +750,16 @@ class MovieRecommendationApp:
 
 
 if __name__ == "__main__":
+    import asyncio
+
     root = tk.Tk()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = MovieRecommendationApp(root)
-    root.mainloop()
+
+    try:
+        root.mainloop()
+    finally:
+        loop.close()
